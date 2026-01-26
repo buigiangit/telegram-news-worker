@@ -502,7 +502,7 @@ cron.schedule(
 console.log("[NEWS] Scheduled.");
 console.log("[TA] Scheduled test cron at 23:20 Asia/Ho_Chi_Minh");
 
-// OPTIONAL: chạy thử ngay khi start (bạn có thể comment nếu không muốn spam)
+// OPTIONAL: chạy thử ngay khi start (chỉ NEWS, không post TA)
 (async () => {
   try {
     const r1 = await runNewsJob();
@@ -510,11 +510,5 @@ console.log("[TA] Scheduled test cron at 23:20 Asia/Ho_Chi_Minh");
   } catch (e) {
     console.error("[NEWS] First run error:", e.message);
   }
-
-  try {
-    const r2 = await runTaJob();
-    console.log("[TA] First run:", r2);
-  } catch (e) {
-    console.error("[TA] First run error:", e.message);
-  }
 })();
+
