@@ -16,7 +16,7 @@ const MIN_ITEMS = parseInt(process.env.MIN_ITEMS || "5", 10);
 const TA_SYMBOL = process.env.TA_SYMBOL || "BTCUSDT";
 
 // TEST: 23:20 giờ VN mỗi ngày
-const TA_CRON_TEST = "20 23 * * *";
+const TA_CRON_TEST = "0 7 * * *";
 const CRON_TZ = "Asia/Ho_Chi_Minh";
 
 if (!BOT_TOKEN || !CHAT_ID) throw new Error("Missing BOT_TOKEN or CHAT_ID");
