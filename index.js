@@ -486,7 +486,7 @@ cron.schedule(
 );
 
 // TA schedule (test 23:20 VN)
-cron.schedule(
+/*cron.schedule(
   TA_CRON_TEST,
   async () => {
     try {
@@ -497,7 +497,7 @@ cron.schedule(
     }
   },
   { timezone: CRON_TZ }
-);
+);*/
 
 console.log("[NEWS] Scheduled.");
 console.log("[TA] Scheduled test cron at 23:20 Asia/Ho_Chi_Minh");
