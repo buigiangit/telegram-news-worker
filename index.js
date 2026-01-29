@@ -15,6 +15,13 @@ const MIN_ITEMS = parseInt(process.env.MIN_ITEMS || "5", 10);
 
 const TA_SYMBOL = process.env.TA_SYMBOL || "BTCUSDT";
 
+// ===== On-chain / Intermarket (BTC + Gold/Silver) =====
+const ONCHAIN_CRON = process.env.ONCHAIN_CRON || "0 */4 * * *"; // mỗi 4 giờ, phút 0 (theo timezone bên dưới)
+const CQ_ACCESS_TOKEN = process.env.CQ_ACCESS_TOKEN; // CryptoQuant Bearer token
+const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY;   // TwelveData API key
+const CQ_EXCHANGE = process.env.CQ_EXCHANGE || "all_exchange"; // all_exchange | spot_exchange | derivative_exchange
+const BTC_SYMBOL = process.env.BTC_SYMBOL || "BTCUSDT";
+
 // TEST: 23:20 giờ VN mỗi ngày
 const TA_CRON_TEST = "0 7 * * *";
 const CRON_TZ = "Asia/Ho_Chi_Minh";
@@ -48,6 +55,45 @@ function fmt(n) {
 
 function clamp(x, a, b) {
   return Math.max(a, Math.min(b, x));
+}
+
+function toNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
+function fmtPct(n) {
+  if (!Number.isFinite(n)) return "n/a";
+  const sign = n >= 0 ? "+" : "";
+  return `${sign}${n.toFixed(2)}%`;
+}
+
+function fmtBtc(n) {
+  if (!Number.isFinite(n)) return "n/a";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toFixed(2)} BTC`;
+}
+
+function nowVN() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: CRON_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+  const d = parts.find(p => p.type === "day")?.value;
+  const m = parts.find(p => p.type === "month")?.value;
+  const y = parts.find(p => p.type === "year")?.value;
+  return `${d}/${m}/${y}`;
+}
+
+async function getJson(url, headers = {}) {
+  const res = await fetch(url, { headers: { accept: "application/json", ...headers } });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 400)}`);
+  return json;
 }
 
 // Keyword filter (news)
@@ -468,8 +514,268 @@ async function runTaJob() {
   return { sent: true, symbol: TA_SYMBOL };
 }
 
+// =========================================================
+// ========= INTERMARKET ONCHAIN JOB (H4 + 1D) ==============
+// =========================================================
+async function cqGet(path, params = {}) {
+  if (!CQ_ACCESS_TOKEN) throw new Error("Missing CQ_ACCESS_TOKEN (CryptoQuant)");
+  const base = "https://api.cryptoquant.com/v1";
+  const url = new URL(base + path);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, String(v)));
+
+  const j = await getJson(url.toString(), { Authorization: `Bearer ${CQ_ACCESS_TOKEN}` });
+  if (j?.status?.code && j.status.code !== 200) {
+    throw new Error(`CryptoQuant status ${j.status.code}: ${j.status.message}`);
+  }
+  return j;
+}
+
+function aggregateH4FromHourlyNetflow(hourlyData) {
+  const slice = hourlyData.slice(0, 4); // newest-first
+  if (slice.length < 4) throw new Error("Not enough hourly netflow points to build H4.");
+  const sum = slice.reduce((acc, x) => acc + (Number(x.netflow_total) || 0), 0);
+  return { h4_ending_at: slice[0]?.date, netflow_h4_btc: sum, points: slice };
+}
+
+async function getBtcNetflowH4() {
+  const j = await cqGet("/btc/exchange-flows/netflow", {
+    exchange: CQ_EXCHANGE,
+    window: "hour",
+    limit: 12
+  });
+  const data = j?.result?.data || [];
+  if (!data.length) throw new Error("CryptoQuant returned empty netflow data.");
+  return aggregateH4FromHourlyNetflow(data);
+}
+
+async function getBtcVolumeH4() {
+  const url = new URL("https://api.binance.com/api/v3/klines");
+  url.searchParams.set("symbol", BTC_SYMBOL);
+  url.searchParams.set("interval", "1h");
+  url.searchParams.set("limit", "12");
+
+  const klines = await getJson(url.toString());
+  if (!Array.isArray(klines) || !klines.length) throw new Error("Binance returned empty klines.");
+
+  const last4 = klines.slice(-4);
+  const volumes = last4.map(k => toNum(k[5])).filter(Number.isFinite);
+  const closes = last4.map(k => toNum(k[4])).filter(Number.isFinite);
+
+  const volH4 = volumes.reduce((a, b) => a + b, 0);
+  const closeNow = closes[closes.length - 1];
+  const closePrev = closes[0];
+  const pct = (Number.isFinite(closeNow) && Number.isFinite(closePrev) && closePrev !== 0)
+    ? (closeNow / closePrev - 1) * 100
+    : null;
+
+  return { btc_vol_h4: volH4, btc_change_h4_pct: pct, btc_close: closeNow };
+}
+
+async function getBtcRange1D() {
+  const url = new URL("https://api.binance.com/api/v3/klines");
+  url.searchParams.set("symbol", BTC_SYMBOL);
+  url.searchParams.set("interval", "1d");
+  url.searchParams.set("limit", "3");
+
+  const klines = await getJson(url.toString());
+  if (!Array.isArray(klines) || klines.length < 2) throw new Error("Binance returned insufficient 1D klines.");
+
+  const closed = klines[klines.length - 2]; // candle đã đóng
+  const high = toNum(closed[2]);
+  const low = toNum(closed[3]);
+  const close = toNum(closed[4]);
+
+  const range = (Number.isFinite(high) && Number.isFinite(low)) ? (high - low) : null;
+  const rangePct = (Number.isFinite(range) && Number.isFinite(close) && close !== 0) ? (range / close) * 100 : null;
+
+  return { high, low, close, range, rangePct };
+}
+
+async function getTwelveChangeH4(symbol) {
+  if (!TWELVEDATA_KEY) throw new Error("Missing TWELVEDATA_KEY (TwelveData)");
+
+  const url = new URL("https://api.twelvedata.com/time_series");
+  url.searchParams.set("symbol", symbol);      // "XAU/USD" or "XAG/USD"
+  url.searchParams.set("interval", "1h");
+  url.searchParams.set("outputsize", "10");
+  url.searchParams.set("apikey", TWELVEDATA_KEY);
+
+  const j = await getJson(url.toString());
+  if (j?.status === "error") throw new Error(`TwelveData error: ${j?.message || "unknown"}`);
+
+  const values = j?.values || [];
+  if (!values.length) throw new Error(`TwelveData empty series for ${symbol}`);
+
+  const closes = values.slice(0, 5).map(v => toNum(v.close)).filter(Number.isFinite); // newest-first
+  if (closes.length < 5) throw new Error(`Not enough closes for ${symbol}`);
+
+  const now = closes[0];
+  const prev4h = closes[4];
+  const pct = (prev4h !== 0) ? (now / prev4h - 1) * 100 : null;
+  return { now, prev4h, pct };
+}
+
+// ===== Language Engine (tự đổi câu chữ theo dữ liệu) =====
+function classifyBtcH4Move(pct) {
+  if (!Number.isFinite(pct)) return { key: "NA", label: "n/a" };
+  const a = Math.abs(pct);
+  if (a < 0.30) return { key: "FLAT", label: "đi ngang" };
+  if (a < 0.80) return { key: "MOVE", label: "dao động" };
+  return { key: "STRONG", label: "biến động mạnh" };
+}
+
+function classifyNetflowH4(btc) {
+  if (!Number.isFinite(btc)) return { key: "NA", bias: "TRUNG TÍNH", icon: "⚪️" };
+  if (btc <= -500) return { key: "BIG_OUT", bias: "TÍCH LŨY", icon: "🟢" };
+  if (btc >= 500) return { key: "BIG_IN", bias: "PHÂN PHỐI", icon: "🔴" };
+  if (btc < 0) return { key: "SMALL_OUT", bias: "NGHIÊNG RÚT", icon: "🟡" };
+  if (btc > 0) return { key: "SMALL_IN", bias: "NGHIÊNG NẠP", icon: "🟠" };
+  return { key: "ZERO", bias: "TRUNG TÍNH", icon: "⚪️" };
+}
+
+function classifyRange1D(rangePct) {
+  if (!Number.isFinite(rangePct)) return { key: "NA", label: "n/a" };
+  if (rangePct < 2.0) return { key: "NARROW", label: "HẸP" };
+  if (rangePct > 4.0) return { key: "WIDE", label: "RỘNG" };
+  return { key: "MID", label: "TRUNG BÌNH" };
+}
+
+function classifyMetalH4(pct) {
+  if (!Number.isFinite(pct)) return { key: "NA", label: "n/a" };
+  if (pct > 0.50) return { key: "UP_STRONG", label: "tăng mạnh" };
+  if (pct < -0.50) return { key: "DOWN", label: "giảm" };
+  return { key: "FLAT", label: "đi ngang" };
+}
+
+function sentenceBtcContext({ moveKey, netflowKey }) {
+  if (moveKey === "FLAT" && (netflowKey === "ZERO" || netflowKey === "SMALL_IN" || netflowKey === "SMALL_OUT")) {
+    return "BTC đang giữ nhịp đi ngang, thiếu lực bứt phá rõ ràng; thị trường có xu hướng chờ thanh khoản.";
+  }
+  if (moveKey === "FLAT" && netflowKey === "BIG_OUT") {
+    return "BTC đi ngang nhưng rút sàn mạnh; thiên hướng tích lũy xuất hiện dù giá chưa mở biên.";
+  }
+  if (moveKey === "FLAT" && netflowKey === "BIG_IN") {
+    return "BTC đi ngang nhưng nạp sàn tăng mạnh; cần thận trọng rủi ro xả khi giá chưa có lực mua đẩy.";
+  }
+  if (moveKey === "STRONG") {
+    return "BTC đang mở biên mạnh ở H4; ưu tiên quản trị rủi ro vì dễ có nhịp quét 2 đầu.";
+  }
+  return "BTC có dao động H4 nhưng chưa đủ để kết luận xu hướng; ưu tiên chờ thêm xác nhận.";
+}
+
+function sentenceRange1D(rangeKey) {
+  if (rangeKey === "NARROW") return "Biên độ 1D co hẹp → nén biến động; breakout nếu xảy ra thường cần volume xác nhận.";
+  if (rangeKey === "WIDE") return "Biên độ 1D nở rộng → biến động mạnh, rủi ro quét tăng; ưu tiên kỷ luật SL.";
+  return "Biên độ 1D trung bình → theo dõi phản ứng giá tại vùng hỗ trợ/kháng cự quan trọng.";
+}
+
+function sentenceLiquidityShift({ btcMoveKey, xauKey, xagKey }) {
+  const metalsStrong = (xauKey === "UP_STRONG") || (xagKey === "UP_STRONG");
+  const btcFlat = (btcMoveKey === "FLAT");
+
+  if (btcFlat && metalsStrong) {
+    return { shift: true, line: "Vàng/bạc tăng mạnh trong khi BTC đi ngang → khả năng cao thanh khoản ngắn hạn đang dịch chuyển sang nhóm kim loại quý." };
+  }
+  if (metalsStrong) {
+    return { shift: true, line: "Vàng/bạc đang chạy mạnh → dòng tiền có xu hướng ưu tiên nơi có biên độ tốt hơn." };
+  }
+  return { shift: false, line: "Chưa thấy tín hiệu rõ ràng về dịch chuyển thanh khoản sang vàng/bạc." };
+}
+
+function sentenceBigMoney({ shift, netflowKey }) {
+  if (shift && (netflowKey === "ZERO" || netflowKey === "SMALL_OUT" || netflowKey === "SMALL_IN")) {
+    return "Mẫu hình BTC im + vàng/bạc chạy thường phản ánh vị thế lớn đang ưu tiên giao dịch narrative kim loại quý; BTC có thể bị “bỏ qua” tạm thời.";
+  }
+  if (netflowKey === "BIG_OUT") return "Rút sàn mạnh thường là tín hiệu dòng tiền dài hơi thiên về tích lũy (dù giá có thể chưa tăng ngay).";
+  if (netflowKey === "BIG_IN") return "Nạp sàn mạnh thường đi kèm áp lực cung tiềm ẩn; cần cảnh giác khi giá chưa có lực mua chủ động.";
+  return "Dòng tiền lớn chưa cho tín hiệu cực đoan; ưu tiên đánh theo xác nhận của giá và thanh khoản.";
+}
+
+function buildIntermarketReport({ btc, netflowH4, xauPct, xagPct, btc1d }) {
+  const dateStr = nowVN();
+
+  const move = classifyBtcH4Move(btc.btc_change_h4_pct);
+  const nf = classifyNetflowH4(netflowH4);
+  const r1d = classifyRange1D(btc1d?.rangePct);
+  const xau = classifyMetalH4(xauPct);
+  const xag = classifyMetalH4(xagPct);
+
+  const shiftInfo = sentenceLiquidityShift({ btcMoveKey: move.key, xauKey: xau.key, xagKey: xag.key });
+
+  const btcContext = sentenceBtcContext({ moveKey: move.key, netflowKey: nf.key });
+  const rangeText = sentenceRange1D(r1d.key);
+  const bigMoney = sentenceBigMoney({ shift: shiftInfo.shift, netflowKey: nf.key });
+
+  const btcCloseStr = Number.isFinite(btc.btc_close) ? btc.btc_close.toLocaleString("en-US") : "n/a";
+  const btcH4Str = Number.isFinite(btc.btc_change_h4_pct) ? `${btc.btc_change_h4_pct >= 0 ? "+" : ""}${btc.btc_change_h4_pct.toFixed(2)}%` : "n/a";
+
+  const hiStr = Number.isFinite(btc1d?.high) ? btc1d.high.toLocaleString("en-US") : "n/a";
+  const loStr = Number.isFinite(btc1d?.low) ? btc1d.low.toLocaleString("en-US") : "n/a";
+  const rangePctStr = Number.isFinite(btc1d?.rangePct) ? `${btc1d.rangePct.toFixed(2)}%` : "n/a";
+
+  const btcSummary =
+    (nf.key === "BIG_OUT") ? "Thiên hướng tích lũy (rút sàn mạnh), nhưng vẫn cần giá/volume xác nhận." :
+    (nf.key === "BIG_IN") ? "Cẩn trọng áp lực cung (nạp sàn mạnh), ưu tiên phòng thủ." :
+    (move.key === "FLAT") ? "Sideway – chờ thanh khoản, tránh fomo sớm." :
+    "Quan sát thêm phản ứng giá ở vùng quan trọng.";
+
+  const metalSummary =
+    shiftInfo.shift ? "Kim loại quý đang hút chú ý ngắn hạn → có thể trade ngắn hạn, ưu tiên x nhỏ." :
+    "Chưa có lực hút rõ → ưu tiên tập trung BTC & chờ xác nhận.";
+
+  return `📊 <b>DÒNG TIỀN LIÊN THỊ TRƯỜNG | BTC – VÀNG/BẠC</b>
+<i>${dateStr} | Khung: H4 (flow) + 1D (range)</i>
+
+❇️ <b>BTC – Thông số kỹ thuật</b>
+🔹 Giá hiện tại: <b>${btcCloseStr}</b>
+🔹 Biến động H4: <b>${btcH4Str}</b> (${move.label})
+🔹 Exchange Netflow H4: <b>${fmtBtc(netflowH4)}</b> ${nf.icon} (<b>${nf.bias}</b>)
+👉 Nhận định: ${btcContext}
+
+❇️ <b>Vàng/Bạc – Thông số kỹ thuật</b>
+🔹 XAUUSD H4: <b>${fmtPct(xauPct)}</b> (${xau.label})
+🔹 XAGUSD H4: <b>${fmtPct(xagPct)}</b> (${xag.label})
+👉 Nhận định: ${shiftInfo.line}
+
+🟡 <b>Góc nhìn dòng tiền lớn</b>
+👉 ${bigMoney}
+
+❇️ <b>Biên độ BTC (1D)</b>
+🔹 High/Low: <b>${hiStr}</b> / <b>${loStr}</b>
+🔹 Range 1D: <b>${rangePctStr}</b> | Trạng thái: <b>${r1d.label}</b>
+👉 Nhận định: ${rangeText}
+
+❇️ <b>Tổng kết</b>
+🔹 BTC: ${btcSummary}
+🔹 Vàng/Bạc: ${metalSummary}
+
+⚠️ <i>Nhận định mang tính tham khảo, không phải lời khuyên đầu tư.</i>`;
+}
+
+async function runIntermarketOnchainJob() {
+  // Lấy dữ liệu song song
+  const [nf, btc, btc1d, xau, xag] = await Promise.all([
+    getBtcNetflowH4(),
+    getBtcVolumeH4(),
+    getBtcRange1D(),
+    getTwelveChangeH4("XAU/USD"),
+    getTwelveChangeH4("XAG/USD")
+  ]);
+
+  const report = buildIntermarketReport({
+    btc,
+    netflowH4: nf.netflow_h4_btc,
+    xauPct: xau.pct,
+    xagPct: xag.pct,
+    btc1d
+  });
+
+  await sendTelegramMessage(report);
+  return { sent: true, exchange: CQ_EXCHANGE, symbol: BTC_SYMBOL };
+}
+
 // ================= RUN =================
-console.log(`[WORKER] Started. NEWS_CRON=${NEWS_CRON} | TA_CRON_TEST=${TA_CRON_TEST} | TZ=${CRON_TZ}`);
+console.log(`[WORKER] Started. NEWS_CRON=${NEWS_CRON} | ONCHAIN_CRON=${ONCHAIN_CRON} | TZ=${CRON_TZ}`);
 
 // NEWS schedule
 cron.schedule(
@@ -480,6 +786,20 @@ cron.schedule(
       console.log("[NEWS]", r);
     } catch (e) {
       console.error("[NEWS] Error:", e.message);
+    }
+  },
+  { timezone: CRON_TZ }
+);
+
+// ONCHAIN schedule (mỗi 4h)
+cron.schedule(
+  ONCHAIN_CRON,
+  async () => {
+    try {
+      const r = await runIntermarketOnchainJob();
+      console.log("[ONCHAIN]", r);
+    } catch (e) {
+      console.error("[ONCHAIN] Error:", e.message);
     }
   },
   { timezone: CRON_TZ }
@@ -500,9 +820,10 @@ cron.schedule(
 );*/
 
 console.log("[NEWS] Scheduled.");
+console.log("[ONCHAIN] Scheduled every 4h.");
 console.log("[TA] Scheduled test cron at 23:20 Asia/Ho_Chi_Minh");
 
-// OPTIONAL: chạy thử ngay khi start (chỉ NEWS, không post TA)
+// OPTIONAL: chạy thử ngay khi start (chỉ NEWS, không auto post onchain để tránh spam khi restart)
 (async () => {
   try {
     const r1 = await runNewsJob();
@@ -511,4 +832,3 @@ console.log("[TA] Scheduled test cron at 23:20 Asia/Ho_Chi_Minh");
     console.error("[NEWS] First run error:", e.message);
   }
 })();
-
