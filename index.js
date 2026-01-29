@@ -27,6 +27,13 @@ const RSS_SOURCES = [
   { name: "CoinTelegraph", url: "https://cointelegraph.com/rss" },
   { name: "Decrypt", url: "https://decrypt.co/feed" }
 ];
+function nowVN() {
+  const date = new Date();
+  return date.toLocaleString("vi-VN", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    hour12: false
+  });
+}
 
 // ================= HELPERS =================
 const parser = new Parser({ timeout: 15000 });
